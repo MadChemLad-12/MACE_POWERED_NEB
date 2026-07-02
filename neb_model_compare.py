@@ -37,7 +37,6 @@ USAGE:
 ==============================================================================
 """
 
-
 import os
 import re
 import csv
@@ -127,11 +126,11 @@ MODELS = {
         "label": "MACE-MP-0b3",
         "color": "#2196F3",
     },
-    "finetuned_v4": {
-        "path":  "/home/user/Documents/Models/Simulations/MACE/neb/mace_V4_active_learning_stagetwo.model",
-        "label": "MACE-V4",
-        "color": "#F44336",
-    },
+    #"finetuned_v4": {
+    #    "path":  "/home/user/Documents/Models/Simulations/MACE/neb/mace_V4_active_learning_stagetwo.model",
+    #    "label": "MACE-V4",
+    #    "color": "#F44336",
+    #},
     "finetuned_v5": {
         "path":  "/home/user/Documents/Programs/Python/ASE/MACE/active_learning/mace_V5_active_learning_stagetwo.model",
         "label": "MACE-V5",
@@ -200,7 +199,7 @@ ABORT_ON_VALIDATION_FAIL = False
 N_IMAGES      = 12
 NEB_FMAX      = 0.8
 NEB_OPTIMIZER = "FIRE"
-NEB_MAX_STEPS = 500
+NEB_MAX_STEPS = 800
 CLIMB         = False
 FIX_BY_HEIGHT = True
 FIX_HEIGHT_THRESHOLD = 2.7      # Å — fix atoms below this z-height
@@ -212,7 +211,7 @@ PATHOLOGY_ATOM_DISP     = 3.0   # Å — flag image if any atom moved > this vs 
 PATHOLOGY_ENERGY_ABS    = 5.0   # eV above initial energy → absolute flag
 
 # ── DFT refinement (ground truth for the leaderboard) ──────────────────────
-RUN_DFT_REFINEMENT = True
+RUN_DFT_REFINEMENT = False
 DFT_TYPE           = "vasp"
 DFT_COMMAND        = "vasp_std"
 # Set True (or pass --force-dft) to re-run VASP NEB polish even if a cached
@@ -1883,11 +1882,11 @@ def write_cp2k_sp(atoms, name: str, outdir) -> str:
 def parse_cp2k_out(outfile_path, atoms):
     """
     Parse one CP2K .out file and return (energy_eV, forces, stress_voigt, ok).
-    `forces` is None and ok=False if parsing failed or SCF didn't converge —
-    callers should keep the MACE value for that image rather than trust this.
-    Forces array shape matches `atoms` (N, 3) in eV/Å; stress_voigt is a
-    6-vector [xx, yy, zz, yz, xz, xy] in GPa, or None if not printed.
-
+    ok=True as long as energy was found — forces are optional. If forces
+    can't be parsed (wrong count, format issue, etc.) we still return ok=True
+    with forces=None so the energy at least makes it into the profile; the
+    SinglePointCalculator caller handles None forces gracefully. ok=False
+    only if energy itself couldn't be found or SCF didn't converge.
     A geo_opt run prints one ENERGY|/ATOMIC FORCES block per optimizer
     iteration — this always takes the LAST one (the converged/final
     geometry), not the first.
@@ -1895,81 +1894,210 @@ def parse_cp2k_out(outfile_path, atoms):
     outfile = Path(outfile_path)
     if not outfile.exists():
         return None, None, None, False
-
+    
     content = outfile.read_text()
+    
     if "SCF run NOT converged" in content:
+        print(f"      [!] {outfile.name}: SCF not converged — skipping.")
         return None, None, None, False
-
+    
+    # ── Energy ────────────────────────────────────────────────────────────────
     energy_matches = re.findall(
-        r"ENERGY\| Total FORCE_EVAL \( QS \) energy \[a\.u\.\]:\s+([-\d.]+)",
+        r"ENERGY\| Total FORCE_EVAL \( QS \) energy \[hartree\]\s+([-+]?\d+\.\d+)",
         content
     )
+    
     if not energy_matches:
+        # Not a CP2K QS output at all (e.g. vasp.out got through the filter)
+        print(f"      [!] {outfile.name}: no CP2K energy line found — "
+              f"wrong file type or incomplete run.")
         return None, None, None, False
+    
     energy_eV = float(energy_matches[-1]) * HA_TO_EV
-
+    
+    # ── Forces ────────────────────────────────────────────────────────────────
+    # CP2K force lines: "    idx  kind  symbol  fx  fy  fz"  (6 fields)
+    # A header line "# Atom  Kind  Element  X  Y  Z" is also 6 fields but
+    # its numeric columns aren't floats, so float() conversion fails safely.
+    # I dont know why I cant get this force section to work
     force_blocks = re.findall(
-        r"ATOMIC FORCES in \[a\.u\.\](.*?)SUM OF ATOMIC FORCES",
+        r"FORCES\| Atomic forces \[hartree/bohr\](.*?)SUM OF ATOMIC FORCES",
         content, re.DOTALL
     )
+    
     forces = None
     if force_blocks:
         parsed = []
         for line in force_blocks[-1].strip().split("\n"):
             parts = line.split()
-            if len(parts) == 6:   # idx  kind  symbol  fx  fy  fz
-                parsed.append([float(parts[3]) * HA_BOHR_TO_EV_ANG,
-                                float(parts[4]) * HA_BOHR_TO_EV_ANG,
-                                float(parts[5]) * HA_BOHR_TO_EV_ANG])
-        if len(parsed) == len(atoms):
+            if len(parts) == 6:
+                try:
+                    parsed.append([
+                        float(parts[3]) * HA_BOHR_TO_EV_ANG,
+                        float(parts[4]) * HA_BOHR_TO_EV_ANG,
+                        float(parts[5]) * HA_BOHR_TO_EV_ANG
+                    ])
+                except ValueError:
+                    pass   # header line — skip silently
+        
+        n_atoms = len(atoms) if atoms is not None else None
+        if n_atoms is not None and len(parsed) == n_atoms:
+            forces = np.array(parsed)
+        elif n_atoms is not None and len(parsed) != n_atoms:
+            print(f"      [!] {outfile.name}: force count mismatch "
+                  f"(got {len(parsed)}, expected {n_atoms}) — using energy only.")
+        elif n_atoms is None and parsed:
             forces = np.array(parsed)
         else:
-            print(f"      [!] {outfile.name}: force count mismatch "
-                  f"(got {len(parsed)}, expected {len(atoms)}) — forces unusable.")
-
+            print(f"      [~] {outfile.name}: no ATOMIC FORCES block found — "
+                  f"using energy only (forces not printed or run incomplete).")
+    
+    # ── Stress ────────────────────────────────────────────────────────────────
     stress_voigt = None
     stress = parse_stress_from_out(content)
     if stress is not None:
         stress_voigt = stress[[0, 1, 2, 1, 0, 0], [0, 1, 2, 2, 2, 1]]
-
-    return energy_eV, forces, stress_voigt, (forces is not None)
+    
+    # ok=True as long as we have energy — forces are a bonus, not a requirement
+    return energy_eV, forces, stress_voigt, True
 
 
 def write_vasp_inputs(name: str, mace_images: list) -> str:
     """
     Write VASP input files (POSCAR/INCAR/KPOINTS/POTCAR) for every moving
-    image of this config's DFT-refinement pathway WITHOUT launching VASP.
-    Mirrors the exact directory layout run_dft_path_refinement() uses
-    ({OUTPUT_ROOT}/dft_refinement/{name}/image_XX/), so
-    read_dft_outputs_from_disk() can later find the OUTCARs you copy back
-    from the HPC into those same folders.
-
-    Endpoints (image 0 and -1) are never sent to VASP in this pipeline —
-    they keep their MACE-derived energy/forces, same as run_dft_path_refinement().
+    image of the DFT-refinement pathway to
+    {OUTPUT_ROOT}/dft_refinement/{name}/image_XX/, WITHOUT launching VASP.
+    Endpoint images (0 and -1) are skipped — they never go through VASP.
+    Mirrors the exact directory layout run_dft_path_refinement() uses so
+    the resulting image_XX/ folders can be submitted directly to an HPC
+    scheduler; copy the OUTCARs back into the same folders afterwards and
+    re-run with --read-dft-results.
     """
     from ase.calculators.vasp import Vasp
+    from ase.io import write as ase_write
 
     cfg_dft_root = os.path.join(OUTPUT_ROOT, "dft_refinement", name)
     written_dirs = []
+
     for idx, atoms in enumerate(mace_images[1:-1], start=1):
         image_dir = os.path.join(cfg_dft_root, f"image_{idx:02d}")
         os.makedirs(image_dir, exist_ok=True)
+
         calc = Vasp(directory=image_dir, **DFT_PARAMS)
-        calc.write_input(atoms)   # writes POSCAR/INCAR/KPOINTS/POTCAR, never calls VASP
+        atoms_copy = atoms.copy()
+        atoms_copy.calc = calc
+        try:
+            calc.write_input(atoms_copy)
+        except Exception as e:
+            print(f"      [!] {name}/image_{idx:02d}: could not write VASP inputs: {e}")
+            continue
         written_dirs.append(image_dir)
 
     manifest = {
         "name": name,
+        "dft_type": "vasp",
+        "vasp_nsw": DFT_PARAMS.get("nsw", 0),
         "n_images_total": len(mace_images),
         "n_moving_images": len(written_dirs),
         "moving_image_dirs": [os.path.basename(d) for d in written_dirs],
+        "expected_output": "OUTCAR",
     }
+
     with open(os.path.join(cfg_dft_root, "vasp_inputs_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"    [✓] Wrote VASP inputs for {len(written_dirs)} moving image(s) of '{name}' to "
-          f"{cfg_dft_root}/image_XX/ — no VASP run was launched.")
+    mode_str = (f"geo_opt (nsw={DFT_PARAMS.get('nsw', 0)}, ibrion={DFT_PARAMS.get('ibrion', -1)})"
+                if DFT_PARAMS.get("nsw", 0) > 0 else "single-point (nsw=0)")
+    print(f"    [✓] Wrote VASP inputs ({mode_str}) for {len(written_dirs)} moving "
+          f"image(s) of '{name}' to {cfg_dft_root}/image_XX/ — no VASP run was launched.")
     return cfg_dft_root
+
+def _is_cp2k_output(path: Path) -> bool:
+    """Quick check: does this .out file look like CP2K output rather than VASP?
+    Reads only the first 50 lines to avoid loading huge files."""
+    try:
+        with open(path) as f:
+            head = "".join(f.readline() for _ in range(50))
+        return "CP2K|" in head or "PROGRAM STARTED" in head or "CP2K version" in head
+    except Exception:
+        return False
+
+
+# Filenames that VASP commonly writes to the working directory — excluded
+# from the CP2K output scanner so they don't get mistakenly parsed as CP2K.
+_VASP_OUTPUT_NAMES = {
+    "vasp.out", "vasprun.xml", "OUTCAR", "OSZICAR", "CONTCAR",
+    "DOSCAR", "EIGENVAL", "XDATCAR", "PCDAT", "IBZKPT",
+}
+
+
+def _find_cp2k_output_files(image_dir: str):
+    """
+    Scan `image_dir` for CP2K output files rather than expecting a fixed
+    naming convention. Returns (out_path, pos_xyz_path) where either may be
+    None if not found. Handles the common naming variants:
+        {name}_image_{idx:02d}.out   (written by write_cp2k_inputs)
+        {name}_img{idx:02d}.out      (common HPC submission convention)
+        any other single .out file in the directory
+    Likewise for the geometry trajectory: {project}-pos-1.xyz.
+    The project name is inferred from the .inp file if present, since CP2K
+    always names its output files after PROJECT_NAME in &GLOBAL.
+
+    Explicitly excludes known VASP output filenames so that mixed VASP+CP2K
+    directories (common when both backends have been run) always pick the
+    right file for the active --dft-type.
+    """
+    image_dir = Path(image_dir)
+    if not image_dir.is_dir():
+        return None, None
+
+    # Prefer the .out whose stem matches the .inp file (same PROJECT_NAME),
+    # fall back to any single .out in the directory.
+    inp_files = list(image_dir.glob("*.inp"))
+    project_name = inp_files[0].stem if inp_files else None
+
+    out_path = None
+    if project_name:
+        candidate = image_dir / f"{project_name}.out"
+        if candidate.exists():
+            out_path = candidate
+
+    if out_path is None:
+        out_candidates = [
+            f for f in image_dir.glob("*.out")
+            if f.name not in _VASP_OUTPUT_NAMES
+            and not f.name.endswith(".err")
+        ]
+        if len(out_candidates) == 1:
+            out_path = out_candidates[0]
+        elif len(out_candidates) > 1:
+            # Multiple candidates — prefer the one matching the .inp stem,
+            # then prefer ones that look like CP2K output
+            named = [f for f in out_candidates if project_name and f.stem == project_name]
+            if named:
+                out_path = named[0]
+            else:
+                cp2k_like = [f for f in out_candidates if _is_cp2k_output(f)]
+                out_path = cp2k_like[0] if cp2k_like else out_candidates[0]
+            print(f"      [~] {image_dir.name}: multiple .out candidates, using "
+                  f"{out_path.name}")
+        elif len(out_candidates) == 0 and not project_name:
+            # No non-VASP .out found and no .inp to guide us — nothing to parse
+            return None, None
+
+    # CP2K writes the position trajectory as {PROJECT_NAME}-pos-1.xyz
+    pos_path = None
+    if out_path is not None:
+        pos_candidate = image_dir / f"{out_path.stem}-pos-1.xyz"
+        if pos_candidate.exists():
+            pos_path = pos_candidate
+        else:
+            pos_candidates = list(image_dir.glob("*-pos-1.xyz"))
+            if pos_candidates:
+                pos_path = pos_candidates[0]
+
+    return (str(out_path) if out_path else None,
+            str(pos_path) if pos_path else None)
 
 
 def read_vasp_outputs_from_disk(name: str, mace_images: list) -> list:
@@ -2073,44 +2201,43 @@ def read_cp2k_outputs_from_disk(name: str, mace_images: list) -> list:
     n_found = 0
     for idx in range(1, len(refined_images) - 1):
         image_dir = os.path.join(cfg_dft_root, f"image_{idx:02d}")
-        out_path = os.path.join(image_dir, f"{name}_image_{idx:02d}.out")
-        if not os.path.exists(out_path):
-            print(f"      [!] {name}/image_{idx:02d}: no .out at {out_path} yet — "
-                  f"keeping MACE value for this image.")
+        out_path, pos_path = _find_cp2k_output_files(image_dir)
+
+        if out_path is None:
+            print(f"      [!] {name}/image_{idx:02d}: no .out file found in "
+                  f"{image_dir}/ yet — keeping MACE value for this image.")
             continue
+
         e, f, stress_voigt, ok = parse_cp2k_out(out_path, refined_images[idx])
         if not ok or e is None:
-            print(f"      [✗] {name}/image_{idx:02d}: could not parse usable energy+forces "
-                  f"from {os.path.basename(out_path)} — keeping MACE value for this image.")
+            print(f"      [✗] {name}/image_{idx:02d}: could not parse energy from "
+                  f"{Path(out_path).name} — keeping MACE value for this image.")
             continue
 
-        if CP2K_RUN_TYPE == "geo_opt":
-            # Positions actually moved during the optimization — CP2K writes
-            # the trajectory to {PROJECT_NAME}-pos-1.xyz alongside the .out;
-            # pick up the final frame so refined_images carries the relaxed
-            # geometry, not just the relaxed energy/forces at the old MACE
-            # positions.
-            traj_path = os.path.join(image_dir, f"{name}_image_{idx:02d}-pos-1.xyz")
-            if os.path.exists(traj_path):
-                try:
-                    final_geom = read(traj_path, index=-1)
-                    if len(final_geom) == len(refined_images[idx]):
-                        refined_images[idx].set_positions(final_geom.get_positions())
-                    else:
-                        print(f"      [!] {name}/image_{idx:02d}: atom count mismatch in "
-                              f"{os.path.basename(traj_path)} — keeping pre-opt positions.")
-                except Exception as err:
-                    print(f"      [!] {name}/image_{idx:02d}: could not read final geometry "
-                          f"from {os.path.basename(traj_path)} ({err}) — keeping pre-opt positions.")
-            else:
-                print(f"      [~] {name}/image_{idx:02d}: geo_opt requested but no "
-                      f"{os.path.basename(traj_path)} found — energy/forces are from CP2K, "
-                      f"but positions are still the pre-opt MACE geometry.")
+        if CP2K_RUN_TYPE == "geo_opt" and pos_path is not None:
+            try:
+                final_geom = read(pos_path, index=-1)
+                if len(final_geom) == len(refined_images[idx]):
+                    refined_images[idx].set_positions(final_geom.get_positions())
+                else:
+                    print(f"      [!] {name}/image_{idx:02d}: atom count mismatch in "
+                          f"{Path(pos_path).name} — keeping pre-opt positions.")
+            except Exception as err:
+                print(f"      [!] {name}/image_{idx:02d}: could not read final geometry "
+                      f"from {Path(pos_path).name} ({err}) — keeping pre-opt positions.")
+        elif CP2K_RUN_TYPE == "geo_opt" and pos_path is None:
+            print(f"      [~] {name}/image_{idx:02d}: geo_opt but no *-pos-1.xyz found "
+                  f"alongside {Path(out_path).name} — positions are still pre-opt MACE geometry.")
 
-        refined_images[idx].calc = SinglePointCalculator(
-            refined_images[idx], energy=e, forces=f,
-            **({"stress": stress_voigt} if stress_voigt is not None else {})
-        )
+        # Build SinglePointCalculator — forces optional (energy-only is fine
+        # for energy-profile comparison; forces being None just means the
+        # pathology/force-RMSE checks will skip this image gracefully)
+        calc_kwargs = {"energy": e}
+        if f is not None:
+            calc_kwargs["forces"] = f
+        if stress_voigt is not None:
+            calc_kwargs["stress"] = stress_voigt
+        refined_images[idx].calc = SinglePointCalculator(refined_images[idx], **calc_kwargs)
         n_found += 1
 
     status = "✓" if n_found == n_expected else "~"
