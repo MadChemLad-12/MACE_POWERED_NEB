@@ -1,0 +1,7 @@
+Name,initial,final
+Close0.75PtO2,structures/inputPt_O.cif,structures/finalPtO2.cif
+Close0.75PtOH2,structures/inputPt_OH2.cif,structures/finalPtOH2.cif
+Naf0.375PtOH,structures/inputPtandHO.cif,structures/finalPtOH.cif
+Naf0.375PtO2,structures/inputPtandO.cif,structures/finalPtO2.cif
+Dry0.25Pt,structures/Input_OandPt.cif,structures/FinalVac59.cif
+Dry0.25PtO,structures/Input_OandPt.cif,structures/FinalVac59_O.cif
